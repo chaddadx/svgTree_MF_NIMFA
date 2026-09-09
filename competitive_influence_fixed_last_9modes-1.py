@@ -502,7 +502,8 @@ class StochasticInfluenceModel:
     def __init__(self, N: int, p: float, T: int, gamma1: float, gamma2: float,
                  alpha12: float, alpha21: float, m1: int, m2: int,
                  random_seeds: bool, iteration: int, graph_model: str = "ER",
-                 graph_params: Optional[dict] = None, base_seed_graph: int = 42):
+                 graph_params: Optional[dict] = None, base_seed_graph: int = 42,
+                 fixed_graph: Optional[nx.Graph] = None):
         self.original_N = int(N)
         self.p = float(p)
         self.T = int(T)
@@ -517,6 +518,9 @@ class StochasticInfluenceModel:
         self.graph_model = str(graph_model)
         self.graph_params = graph_params or {}
         self.base_seed_graph = int(base_seed_graph)
+        # Optional fixed graph used by controlled what-if experiments.
+        # When provided, Monte Carlo repetitions reuse exactly the same network.
+        self.fixed_graph = fixed_graph
 
         self.G = None
         self.N = self.original_N
@@ -537,14 +541,19 @@ class StochasticInfluenceModel:
                     return sorted(list(cc))
             return None
 
-        self.G = generate_graph(self.graph_model, self.original_N, self.p,
-                                self.base_seed_graph + self.iteration, self.graph_params)
-        self.G = _simple_graph(self.G)
+        if self.fixed_graph is None:
+            self.G = generate_graph(self.graph_model, self.original_N, self.p,
+                                    self.base_seed_graph + self.iteration, self.graph_params)
+            self.G = _simple_graph(self.G)
+        else:
+            # Reuse one realized network so that a what-if experiment changes
+            # only the quantity being studied (seed position or one parameter).
+            self.G = _simple_graph(self.fixed_graph.copy())
         self.N = self.G.number_of_nodes()
         self.states = np.zeros(self.N, dtype=int)
 
         comp = pick_component_with_n_nodes(self.G, n_required)
-        if comp is None:
+        if comp is None and self.fixed_graph is None:
             for tries in range(60):
                 self.G = generate_graph(self.graph_model, self.original_N, self.p,
                                         10000 + self.iteration * 97 + tries, self.graph_params)
@@ -2258,6 +2267,443 @@ def experiment_size_scaling(cfg: ExperimentConfig, sizes: Optional[List[int]] = 
     return rows
 
 
+
+# ============================================================
+# COMPETITION WHAT-IF ANALYSIS 
+# ============================================================
+
+def _mean_ci95(values):
+    """Return mean and a two-sided 95% CI for Monte Carlo observations.
+
+    Student-t is used when SciPy is available; otherwise the large-sample
+    1.96 critical value is used. With the intended R=1000 runs the difference
+    is negligible.
+    """
+    arr = np.asarray(values, dtype=float)
+    n = int(arr.size)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    mean = float(np.mean(arr))
+    if n == 1:
+        return mean, mean, mean
+    sd = float(np.std(arr, ddof=1))
+    se = sd / math.sqrt(n)
+    try:
+        from scipy.stats import t as student_t
+        crit = float(student_t.ppf(0.975, n - 1))
+    except Exception:
+        crit = 1.96
+    return mean, mean - crit * se, mean + crit * se
+
+
+def _largest_component_nodes(G: nx.Graph) -> List[int]:
+    comps = sorted(nx.connected_components(G), key=len, reverse=True)
+    return sorted(list(comps[0])) if comps else list(G.nodes())
+
+
+def _pick_node_near_degree(G: nx.Graph, target_degree: int,
+                           excluded: Optional[set] = None,
+                           avoid_neighbors_of: Optional[int] = None) -> int:
+    """Pick a node in the LCC whose realized degree is closest to target_degree."""
+    excluded = excluded or set()
+    candidates = _largest_component_nodes(G)
+    if avoid_neighbors_of is not None:
+        preferred = [n for n in candidates
+                     if n not in excluded and n != avoid_neighbors_of
+                     and not G.has_edge(n, avoid_neighbors_of)]
+        if preferred:
+            candidates = preferred
+        else:
+            candidates = [n for n in candidates if n not in excluded]
+    else:
+        candidates = [n for n in candidates if n not in excluded]
+    if not candidates:
+        raise ValueError("No candidate node available for the requested seed selection.")
+    return min(candidates, key=lambda n: (abs(G.degree(n) - target_degree), n))
+
+
+def _pick_two_balanced_seed_nodes(G: nx.Graph, target_degree: int) -> Tuple[int, int]:
+    """Pick two non-adjacent nodes with degrees as close as possible to target_degree."""
+    first = _pick_node_near_degree(G, target_degree)
+    second = _pick_node_near_degree(G, target_degree, excluded={first}, avoid_neighbors_of=first)
+    return first, second
+
+
+def _validate_two_project_parameters(gamma1: float, gamma2: float,
+                                     alpha12: float, alpha21: float):
+    vals = [gamma1, gamma2, alpha12, alpha21]
+    if any(v < 0 or v > 1 for v in vals):
+        raise ValueError("All follow/switch probabilities must lie in [0,1].")
+    if gamma1 + alpha12 > 1 + 1e-12:
+        raise ValueError("Need gamma1 + alpha12 <= 1.")
+    if gamma2 + alpha21 > 1 + 1e-12:
+        raise ValueError("Need gamma2 + alpha21 <= 1.")
+
+
+def _run_fixed_graph_competition_scenario(
+        cfg: ExperimentConfig,
+        G: nx.Graph,
+        seed1: int,
+        seed2: int,
+        gamma1: float,
+        gamma2: float,
+        alpha12: float,
+        alpha21: float,
+        num_iterations: int,
+        scenario_seed_offset: int = 0) -> dict:
+    """Run one controlled scenario on the same realized graph and fixed seeds."""
+    _validate_two_project_parameters(gamma1, gamma2, alpha12, alpha21)
+
+    p = float(cfg.k_target) / max(1, (cfg.N - 1))
+    final1, final2, deltas = [], [], []
+
+    for r in range(num_iterations):
+        # Common random-number structure across scenarios improves comparability.
+        rng_seed = int(cfg.base_seed_rng + scenario_seed_offset + r)
+        random.seed(rng_seed)
+        np.random.seed(rng_seed)
+
+        model = StochasticInfluenceModel(
+            N=cfg.N,
+            p=p,
+            T=cfg.T,
+            gamma1=gamma1,
+            gamma2=gamma2,
+            alpha12=alpha12,
+            alpha21=alpha21,
+            m1=1,
+            m2=1,
+            random_seeds=False,
+            iteration=0,
+            graph_model="ER",
+            graph_params={},
+            base_seed_graph=cfg.base_seed_graph,
+            fixed_graph=G,
+        )
+        model.set_manual_seeds([seed1], [seed2])
+        res = model.run_simulation()
+        z1 = float(res[-1]['cumulative1'])
+        z2 = float(res[-1]['cumulative2'])
+        final1.append(z1)
+        final2.append(z2)
+        deltas.append(z1 - z2)
+
+    z1_mean, z1_lo, z1_hi = _mean_ci95(final1)
+    z2_mean, z2_lo, z2_hi = _mean_ci95(final2)
+    d_mean, d_lo, d_hi = _mean_ci95(deltas)
+
+    # NIMFA is deterministic once the graph, seeds and parameters are fixed.
+    model_n = StochasticInfluenceModel(
+        N=cfg.N,
+        p=p,
+        T=cfg.T,
+        gamma1=gamma1,
+        gamma2=gamma2,
+        alpha12=alpha12,
+        alpha21=alpha21,
+        m1=1,
+        m2=1,
+        random_seeds=False,
+        iteration=0,
+        graph_model="ER",
+        graph_params={},
+        base_seed_graph=cfg.base_seed_graph,
+        fixed_graph=G,
+    )
+    model_n.set_manual_seeds([seed1], [seed2])
+    nimfa = model_n.compute_nimfa_model()
+    n1 = float(nimfa[-1]['cum_N1'])
+    n2 = float(nimfa[-1]['cum_N2'])
+
+    if d_mean > 1e-12:
+        winner = "P1"
+    elif d_mean < -1e-12:
+        winner = "P2"
+    else:
+        winner = "Tie"
+
+    return {
+        'seed1': int(seed1),
+        'seed2': int(seed2),
+        'degree1': int(G.degree(seed1)),
+        'degree2': int(G.degree(seed2)),
+        'gamma1': float(gamma1),
+        'gamma2': float(gamma2),
+        'alpha12': float(alpha12),
+        'alpha21': float(alpha21),
+        'sim_Z1_mean': z1_mean,
+        'sim_Z1_ci_low': z1_lo,
+        'sim_Z1_ci_high': z1_hi,
+        'sim_Z2_mean': z2_mean,
+        'sim_Z2_ci_low': z2_lo,
+        'sim_Z2_ci_high': z2_hi,
+        'sim_Delta_mean': d_mean,
+        'sim_Delta_ci_low': d_lo,
+        'sim_Delta_ci_high': d_hi,
+        'winner': winner,
+        'nimfa_Z1': n1,
+        'nimfa_Z2': n2,
+        'nimfa_Delta': n1 - n2,
+    }
+
+
+def _write_competition_whatif_latex(path: str, seed_rows: List[dict], param_rows: List[dict]):
+    """Write compact LaTeX tables that can be pasted into the revised paper."""
+    ensure_dir(os.path.dirname(path) or ".")
+
+    def fmt(x):
+        return f"{float(x):.2f}"
+
+    lines = []
+    lines.append(r"% Auto-generated by experiment_competition_what_if")
+    lines.append(r"% Table A: effect of the local connectivity of the initial active users")
+    lines.append(r"\begin{table}[t]")
+    lines.append(r"\centering")
+    lines.append(r"\small")
+    lines.append(r"\caption{Competition outcome on the same ER graph when the initial positions of the two projects are exchanged.}")
+    lines.append(r"\begin{tabular}{lrrrrr}")
+    lines.append(r"\toprule")
+    lines.append(r"Setting & $d_1$ & $d_2$ & $\mathbb{E}[Z_1^T]$ & $\mathbb{E}[Z_2^T]$ & $\Delta(T)$ \\")
+    lines.append(r"\midrule")
+    for r in seed_rows:
+        label = str(r['scenario']).replace('_', r'\_')
+        lines.append(f"{label} & {r['degree1']} & {r['degree2']} & {fmt(r['sim_Z1_mean'])} & {fmt(r['sim_Z2_mean'])} & {fmt(r['sim_Delta_mean'])} " + r"\\")
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(r"\end{table}")
+    lines.append("")
+
+    lines.append(r"% Table B: one-at-a-time parameter changes")
+    lines.append(r"\begin{table}[t]")
+    lines.append(r"\centering")
+    lines.append(r"\small")
+    lines.append(r"\caption{One-at-a-time competition analysis on a fixed ER graph. All non-varied parameters are kept at their baseline values.}")
+    lines.append(r"\begin{tabular}{lrrrr}")
+    lines.append(r"\toprule")
+    lines.append(r"Parameter & Value & $\mathbb{E}[Z_1^T]$ & $\mathbb{E}[Z_2^T]$ & $\Delta(T)$ \\")
+    lines.append(r"\midrule")
+    for r in param_rows:
+        pname = {'gamma1': r'$\gamma_1$', 'gamma2': r'$\gamma_2$',
+                 'alpha12': r'$\alpha_{12}$', 'alpha21': r'$\alpha_{21}$'}[r['varied_parameter']]
+        lines.append(f"{pname} & {float(r['parameter_value']):.2f} & {fmt(r['sim_Z1_mean'])} & {fmt(r['sim_Z2_mean'])} & {fmt(r['sim_Delta_mean'])} " + r"\\")
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    lines.append(r"\end{table}")
+
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def experiment_competition_what_if(cfg: ExperimentConfig,
+                                   num_iterations: int = 1000,
+                                   weak_target_degree: int = 3,
+                                   strong_target_degree: int = 15):
+    """Reviewer-oriented use case on ONE fixed ER graph.
+
+    Part A isolates the impact of the local network position of the initial
+    active users by exchanging a low-degree and a high-degree seed.
+
+    Part B fixes the graph and uses two similarly connected seeds, then changes
+    exactly one follow/switch parameter at a time. The competition outcome is
+    measured by Delta(T) = E[Z_1^T] - E[Z_2^T].
+    """
+    local = clone_cfg(cfg)
+    local.graph_model = "ER"
+    local.graph_params = {}
+    local.N = 2000
+    local.T = 5
+    local.k_target = 10.0
+    local.num_iterations = int(num_iterations)
+    local.gamma1 = 0.35
+    local.gamma2 = 0.25
+    local.alpha12 = 0.20
+    local.alpha21 = 0.15
+
+    ensure_dir(local.output_dir)
+    p = local.k_target / (local.N - 1)
+    G = nx.erdos_renyi_graph(local.N, p, seed=local.base_seed_graph)
+    G = _simple_graph(G)
+
+    print("" + "=" * 100)
+    print("COMPETITION WHAT-IF ANALYSIS ON ONE FIXED ER GRAPH")
+    print("=" * 100)
+    print(f"N={local.N}, T={local.T}, R={local.num_iterations}, target k={local.k_target:.0f}")
+    print("Baseline parameters:")
+    print(f"  gamma1={local.gamma1}, gamma2={local.gamma2}, alpha12={local.alpha12}, alpha21={local.alpha21}")
+    print(f"Realized average degree = {2 * G.number_of_edges() / G.number_of_nodes():.3f}")
+
+    # ------------------------------------------------------------------
+    # A. Local connectivity / seed position
+    # ------------------------------------------------------------------
+    weak = _pick_node_near_degree(G, weak_target_degree)
+    strong = _pick_node_near_degree(G, strong_target_degree,
+                                    excluded={weak}, avoid_neighbors_of=weak)
+
+    print("\nA) EFFECT OF INITIAL LOCAL CONNECTIVITY")
+    print(f"Weak seed candidate:   node {weak}, degree={G.degree(weak)}")
+    print(f"Strong seed candidate: node {strong}, degree={G.degree(strong)}")
+
+    seed_rows = []
+    seed_settings = [
+        ("P1 weak / P2 strong", weak, strong),
+        ("P1 strong / P2 weak", strong, weak),
+    ]
+    for idx, (label, s1, s2) in enumerate(seed_settings):
+        r = _run_fixed_graph_competition_scenario(
+            local, G, s1, s2,
+            local.gamma1, local.gamma2, local.alpha12, local.alpha21,
+            local.num_iterations,
+            scenario_seed_offset=0,  # same MC random streams for the two placements
+        )
+        r['experiment'] = 'seed_position'
+        r['scenario'] = label
+        seed_rows.append(r)
+
+    seed_table = [[
+        r['scenario'], r['seed1'], r['degree1'], r['seed2'], r['degree2'],
+        r['sim_Z1_mean'], r['sim_Z2_mean'], r['sim_Delta_mean'],
+        f"[{r['sim_Delta_ci_low']:.2f}, {r['sim_Delta_ci_high']:.2f}]", r['winner']
+    ] for r in seed_rows]
+    print(tabulate(seed_table,
+                   headers=["Setting", "P1 seed", "d1", "P2 seed", "d2",
+                            "E[Z1^T]", "E[Z2^T]", "Delta(T)", "95% CI Delta", "Winner"],
+                   tablefmt="grid", floatfmt=".2f"))
+
+    # ------------------------------------------------------------------
+    # B. One-at-a-time follow/switch parameter changes
+    # ------------------------------------------------------------------
+    balanced1, balanced2 = _pick_two_balanced_seed_nodes(G, int(local.k_target))
+    print("\nB) ONE-AT-A-TIME PARAMETER CHANGES")
+    print(f"Balanced fixed seeds: P1 node {balanced1} (degree={G.degree(balanced1)}), "
+          f"P2 node {balanced2} (degree={G.degree(balanced2)})")
+
+    baseline = {
+        'gamma1': local.gamma1,
+        'gamma2': local.gamma2,
+        'alpha12': local.alpha12,
+        'alpha21': local.alpha21,
+    }
+    sweep_values = {
+        'gamma1': [0.20, 0.35, 0.50],
+        'gamma2': [0.10, 0.25, 0.40],
+        'alpha12': [0.05, 0.20, 0.35],
+        'alpha21': [0.00, 0.15, 0.30],
+    }
+
+    param_rows = []
+    scenario_idx = 0
+    for parameter_name, values in sweep_values.items():
+        for value in values:
+            pars = dict(baseline)
+            pars[parameter_name] = float(value)
+            r = _run_fixed_graph_competition_scenario(
+                local, G, balanced1, balanced2,
+                pars['gamma1'], pars['gamma2'], pars['alpha12'], pars['alpha21'],
+                local.num_iterations,
+                scenario_seed_offset=0,  # same MC random streams across parameter settings
+            )
+            r['experiment'] = 'parameter_sweep'
+            r['scenario'] = f"vary_{parameter_name}"
+            r['varied_parameter'] = parameter_name
+            r['parameter_value'] = float(value)
+            param_rows.append(r)
+            scenario_idx += 1
+
+    param_table = [[
+        r['varied_parameter'], r['parameter_value'],
+        r['sim_Z1_mean'], r['sim_Z2_mean'], r['sim_Delta_mean'],
+        f"[{r['sim_Delta_ci_low']:.2f}, {r['sim_Delta_ci_high']:.2f}]", r['winner']
+    ] for r in param_rows]
+    print(tabulate(param_table,
+                   headers=["Varied parameter", "Value", "E[Z1^T]", "E[Z2^T]",
+                            "Delta(T)", "95% CI Delta", "Winner"],
+                   tablefmt="grid", floatfmt=".2f"))
+
+    # Save machine-readable results.
+    seed_csv = os.path.join(local.output_dir, "competition_what_if_seed_position.csv")
+    param_csv = os.path.join(local.output_dir, "competition_what_if_parameter_sweep.csv")
+    write_csv(seed_csv, seed_rows)
+    write_csv(param_csv, param_rows)
+
+    # Combined CSV: normalize keys because the two experiment blocks have
+    # a few block-specific columns (scenario versus varied_parameter/value).
+    all_rows_raw = seed_rows + param_rows
+    all_keys = []
+    for rr in all_rows_raw:
+        for key in rr.keys():
+            if key not in all_keys:
+                all_keys.append(key)
+    all_rows = [{key: rr.get(key, "") for key in all_keys} for rr in all_rows_raw]
+    write_csv(os.path.join(local.output_dir, "competition_what_if_all_results.csv"), all_rows)
+
+    # Ready-to-paste LaTeX tables.
+    latex_path = os.path.join(local.output_dir, "competition_what_if_tables.tex")
+    _write_competition_whatif_latex(latex_path, seed_rows, param_rows)
+
+    # ------------------------------------------------------------------
+    # Figures for the paper / reviewer response
+    # ------------------------------------------------------------------
+    x = np.arange(len(seed_rows))
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x - width / 2, [r['sim_Z1_mean'] for r in seed_rows], width, label='Project 1')
+    ax.bar(x + width / 2, [r['sim_Z2_mean'] for r in seed_rows], width, label='Project 2')
+    ax.set_xticks(x)
+    ax.set_xticklabels([r['scenario'] for r in seed_rows])
+    ax.set_ylabel('Expected cumulative influence at T')
+    ax.set_title('Effect of initial local connectivity on competition')
+    ax.legend()
+    ax.grid(axis='y', alpha=0.25)
+    fig.tight_layout()
+    seed_fig = os.path.join(local.output_dir, "competition_seed_position.png")
+    fig.savefig(seed_fig, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+    axes = axes.ravel()
+    labels = {
+        'gamma1': r'$\gamma_1$',
+        'gamma2': r'$\gamma_2$',
+        'alpha12': r'$\alpha_{12}$',
+        'alpha21': r'$\alpha_{21}$',
+    }
+    for ax, pname in zip(axes, ['gamma1', 'gamma2', 'alpha12', 'alpha21']):
+        rr = [r for r in param_rows if r['varied_parameter'] == pname]
+        vals = [r['parameter_value'] for r in rr]
+        means = [r['sim_Delta_mean'] for r in rr]
+        lows = [r['sim_Delta_mean'] - r['sim_Delta_ci_low'] for r in rr]
+        highs = [r['sim_Delta_ci_high'] - r['sim_Delta_mean'] for r in rr]
+        ax.errorbar(vals, means, yerr=[lows, highs], marker='o', capsize=4)
+        ax.axhline(0.0, linewidth=1.0)
+        ax.set_xlabel(labels[pname])
+        ax.set_ylabel(r'$\Delta(T)$')
+        ax.set_title(f'Vary {pname}; all other parameters fixed')
+        ax.grid(alpha=0.25)
+    fig.suptitle('One-at-a-time effect of model parameters on competition')
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    param_fig = os.path.join(local.output_dir, "competition_parameter_effects.png")
+    fig.savefig(param_fig, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+    print("\nSaved reviewer-oriented what-if outputs:")
+    print(f"  {seed_csv}")
+    print(f"  {param_csv}")
+    print(f"  {latex_path}")
+    print(f"  {seed_fig}")
+    print(f"  {param_fig}")
+
+    return {
+        'graph': G,
+        'seed_rows': seed_rows,
+        'parameter_rows': param_rows,
+        'weak_seed': weak,
+        'strong_seed': strong,
+        'balanced_seed1': balanced1,
+        'balanced_seed2': balanced2,
+        'latex_table_path': latex_path,
+    }
+
+
 # ============================================================
 # MENUS
 # ============================================================
@@ -2295,7 +2741,8 @@ def menu_choose_mode() -> str:
     print("7. Tuned SBM experiment (stronger communities, k≈15)")
     print("8. Lattice demo (random seeds, simulation snapshots, NIMFA nodewise plots)")
     print("9. Error vs k plot (MF and NIMFA against simulation)")
-    return input("Enter choice (1/2/3/4/5/6/7/8/9): ").strip()
+    print("10. Competition what-if analysis on one fixed ER graph ")
+    return input("Enter choice (1/2/3/4/5/6/7/8/9/10): ").strip()
 
 
 # ============================================================
@@ -2367,6 +2814,15 @@ if __name__ == "__main__":
         print("Running k-sweep for error plot.")
         print("Default values use k = 3, 6, ..., 99.")
         experiment_k_sweep_errors(cfg, k_values=list(range(3, 101, 3)), use_final_error=True)
+
+    elif mode == '10':
+        # Reviewer-oriented use case: keep ONE ER graph fixed and study competition.
+        # The paper baseline is used: N=2000, T=5, k=10 and
+        # (gamma1,gamma2,alpha12,alpha21)=(0.35,0.25,0.20,0.15).
+        raw_runs = input("Monte Carlo runs for the what-if analysis [1000]: ").strip()
+        runs = int(raw_runs) if raw_runs else 1000
+        experiment_competition_what_if(cfg, num_iterations=runs,
+                                       weak_target_degree=3, strong_target_degree=15)
     else:
         print("Invalid choice. Running single scenario with default settings.")
         cfg = menu_choose_graph_and_options(cfg)
